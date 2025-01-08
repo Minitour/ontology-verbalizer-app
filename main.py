@@ -160,129 +160,133 @@ def main():
     st.header("Step 1: Upload Ontology OWL File", divider=True)
     uploaded_file = st.file_uploader("Drag and drop or select an OWL file", type=["owl", "ttl"])
 
-    if uploaded_file:
-        graph, initial_vocabulary = load_ontology(uploaded_file)
-        st.success("Ontology loaded successfully!")
+    if not uploaded_file:
+        return
 
-        # Step 2: Select Relationships to Keep
-        st.header("Step 2: Select Relationships to Keep", divider=True)
-        relationships = pd.DataFrame.from_dict(
-            initial_vocabulary.relationship_labels, orient="index", columns=["Label"]
-        ).reset_index().rename(columns={"index": "IRI"})
-        relationships["Keep"] = False
 
-        edited_relationships = st.data_editor(
-            relationships, use_container_width=True, num_rows="dynamic"
+    graph, initial_vocabulary = load_ontology(uploaded_file)
+    st.success("Ontology loaded successfully!")
+
+    # Step 2: Select Relationships to Keep
+    st.header("Step 2: Select Relationships to Keep", divider=True)
+    relationships = pd.DataFrame.from_dict(
+        initial_vocabulary.relationship_labels, orient="index", columns=["Label"]
+    ).reset_index().rename(columns={"index": "IRI"})
+    relationships["Keep"] = False
+
+    edited_relationships = st.data_editor(
+        relationships, use_container_width=True, num_rows="dynamic"
+    )
+    selected_relationships = edited_relationships[edited_relationships["Keep"]]
+    relationships_to_remove = edited_relationships[~edited_relationships["Keep"]]
+
+    st.subheader("Override Identifier Names")
+    rephrased_identifiers = st.data_editor(
+        pd.DataFrame(
+            [
+                {"IRI": key, 'Display': value}
+                for key, value in
+                {
+                    'http://www.w3.org/2002/07/owl#equivalentClass': 'is same as',
+                    'http://www.w3.org/2000/01/rdf-schema#subClassOf': 'is a type of',
+                    'http://www.w3.org/2002/07/owl#intersectionOf': 'all of',
+                    'http://www.w3.org/2002/07/owl#unionOf': 'any of',
+                    'http://www.w3.org/2002/07/owl#disjointWith': 'is different from',
+                    'http://www.w3.org/2002/07/owl#withRestrictions': 'must be',
+                    'http://purl.obolibrary.org/obo/IAO_0000115': 'has definition',
+                }.items()
+            ]
+        ),
+        use_container_width=True,
+        num_rows="dynamic"
+    )
+
+    if len(selected_relationships) == 0:
+        st.warning("At least one relationship must be selected to proceed.")
+        return
+
+    st.success(f"{len(selected_relationships)} relationships selected.")
+
+    # Step 3: Select Sample Size
+    st.header("Step 3: Select Sample Size (Optional)", help="Recommended for large datasets", divider=True)
+    sampler = None
+    if st.toggle("Enable Sampling"):
+        max_concepts = len(initial_vocabulary.object_labels)
+        sample_mode = st.radio("Sampling Mode", ["Fixed Size", "Percentage"], index=0)
+
+        if sample_mode == "Fixed Size":
+            sample_size = st.number_input(
+                "Number of samples", min_value=10, max_value=max_concepts, value=max_concepts
+            )
+            sampler = Sampler(sample_n=sample_size, seed=st.number_input("Seed", value=42))
+        else:
+            sample_percentage = st.slider("Sample Percentage", min_value=10, max_value=100, value=100) / 100
+            sampler = Sampler(sample_percentage=sample_percentage, seed=st.number_input("Seed", value=42))
+
+        st.success("Sampling configuration set.")
+
+    # Step 4: Prompt Configurations
+    st.header("Step 4: Prompt Configurations (Optional)", help="Recommended to generate quality text",
+              divider=True)
+    llm = None
+    if st.toggle("Enable LLM"):
+        model_name = st.selectbox("Model to Use", list(LLM.models.keys()))
+        api_key = st.text_input("OpenAI API Key", type="password")
+        system_prompt = st.text_area(
+            "System Prompt",
+            value=LLM.default_system_message,
+            placeholder="Enter the system prompt here"
         )
-        selected_relationships = edited_relationships[edited_relationships["Keep"]]
-        relationships_to_remove = edited_relationships[~edited_relationships["Keep"]]
 
-        st.subheader("Override Identifier Names")
-        rephrased_identifiers = st.data_editor(
-            pd.DataFrame(
-                [
-                    {"IRI": key, 'Display': value}
-                    for key, value in
-                    {
-                        'http://www.w3.org/2002/07/owl#equivalentClass': 'is same as',
-                        'http://www.w3.org/2000/01/rdf-schema#subClassOf': 'is a type of',
-                        'http://www.w3.org/2002/07/owl#intersectionOf': 'all of',
-                        'http://www.w3.org/2002/07/owl#unionOf': 'any of',
-                        'http://www.w3.org/2002/07/owl#disjointWith': 'is different from',
-                        'http://www.w3.org/2002/07/owl#withRestrictions': 'must be',
-                        'http://purl.obolibrary.org/obo/IAO_0000115': 'has definition',
-                    }.items()
-                ]
-            ),
+        st.subheader("Few-Shot Examples")
+        few_shots = st.data_editor(
+            pd.DataFrame(LLM.default_prompt_template, columns=["User", "Assistant"]),
             use_container_width=True,
             num_rows="dynamic"
         )
 
-        if len(selected_relationships) == 0:
-            st.warning("At least one relationship must be selected to proceed.")
-        else:
-            st.success(f"{len(selected_relationships)} relationships selected.")
+        temperature = st.slider("Temperature", min_value=0.0, max_value=2.0, value=1.0)
 
-            # Step 3: Select Sample Size
-            st.header("Step 3: Select Sample Size (Optional)", help="Recommended for large datasets", divider=True)
-            sampler = None
-            if st.toggle("Enable Sampling"):
-                max_concepts = len(initial_vocabulary.object_labels)
-                sample_mode = st.radio("Sampling Mode", ["Fixed Size", "Percentage"], index=0)
+        message_templates = [
+            {"role": "system", "content": system_prompt}
+        ]
+        for i, row in few_shots.iterrows():
+            if row["User"] and row["Assistant"]:
+                message_templates.append({"role": "user", "content": row["User"]})
+                message_templates.append({"role": "assistant", "content": row["Assistant"]})
 
-                if sample_mode == "Fixed Size":
-                    sample_size = st.number_input(
-                        "Number of samples", min_value=10, max_value=max_concepts, value=max_concepts
-                    )
-                    sampler = Sampler(sample_n=sample_size, seed=st.number_input("Seed", value=42))
-                else:
-                    sample_percentage = st.slider("Sample Percentage", min_value=10, max_value=100, value=100) / 100
-                    sampler = Sampler(sample_percentage=sample_percentage, seed=st.number_input("Seed", value=42))
-
-                st.success("Sampling configuration set.")
-
-            # Step 4: Prompt Configurations
-            st.header("Step 4: Prompt Configurations (Optional)", help="Recommended to generate quality text",
-                      divider=True)
-            llm = None
-            if st.toggle("Enable LLM"):
-                model_name = st.selectbox("Model to Use", list(LLM.models.keys()))
-                api_key = st.text_input("OpenAI API Key", type="password")
-                system_prompt = st.text_area(
-                    "System Prompt",
-                    value=LLM.default_system_message,
-                    placeholder="Enter the system prompt here"
-                )
-
-                st.subheader("Few-Shot Examples")
-                few_shots = st.data_editor(
-                    pd.DataFrame(LLM.default_prompt_template, columns=["User", "Assistant"]),
-                    use_container_width=True,
-                    num_rows="dynamic"
-                )
-
-                temperature = st.slider("Temperature", min_value=0.0, max_value=2.0, value=1.0)
-
-                message_templates = [
-                    {"role": "system", "content": system_prompt}
-                ]
-                for i, row in few_shots.iterrows():
-                    if row["User"] and row["Assistant"]:
-                        message_templates.append({"role": "user", "content": row["User"]})
-                        message_templates.append({"role": "assistant", "content": row["Assistant"]})
-
-                if model_name and api_key:
-                    llm = LLM(
-                        model_name=model_name,
-                        temperature=temperature,
-                        message_templates=message_templates,
-                        api_key=api_key
-                    )
-
-            st.subheader("Actions")
-            preview_sampler = Sampler(sample_n=10, seed=42)
-
-            if 'preview_results' not in st.session_state:
-                st.session_state.preview_results = None
-
-            st.button(
-                "Preview", on_click=compute,
-                args=(initial_vocabulary, relationships_to_remove, rephrased_identifiers, preview_sampler, llm)
+        if model_name and api_key:
+            llm = LLM(
+                model_name=model_name,
+                temperature=temperature,
+                message_templates=message_templates,
+                api_key=api_key
             )
 
-            preview_columns = ["root", "fragment", "text", "llm_text"]
+    st.subheader("Actions")
+    preview_sampler = Sampler(sample_n=10, seed=42)
 
-            if st.session_state.preview_results:
-                try:
-                    first = next(st.session_state.preview_results)
-                    preview_table = st.dataframe(
-                        pd.DataFrame([replace_label(first, initial_vocabulary)], columns=preview_columns))
-                    for result in st.session_state.preview_results:
-                        result = {key: value for key, value in result.items() if key in preview_columns}
-                        preview_table.add_rows(
-                            pd.DataFrame([replace_label(result, initial_vocabulary)], columns=preview_columns))
-                except:
-                    pass
+    if 'preview_results' not in st.session_state:
+        st.session_state.preview_results = None
+
+    st.button(
+        "Preview", on_click=compute,
+        args=(initial_vocabulary, relationships_to_remove, rephrased_identifiers, preview_sampler, llm)
+    )
+
+    preview_columns = ["root", "fragment", "text", "llm_text"]
+
+    if st.session_state.preview_results:
+        try:
+            first = next(st.session_state.preview_results)
+            preview_table = st.dataframe(
+                pd.DataFrame([replace_label(first, initial_vocabulary)], columns=preview_columns))
+            for result in st.session_state.preview_results:
+                result = {key: value for key, value in result.items() if key in preview_columns}
+                preview_table.add_rows(
+                    pd.DataFrame([replace_label(result, initial_vocabulary)], columns=preview_columns))
+        except:
+            pass
 
 
 if __name__ == "__main__":
