@@ -1,13 +1,12 @@
-import streamlit as st
 import pandas as pd
+import streamlit as st
 from openai import OpenAI
-
 from verbalizer.nlp import ParaphraseLanguageModel
+from verbalizer.patterns import owl_disjoint, owl_restriction, owl_first_rest
 from verbalizer.process import Processor
 from verbalizer.sampler import Sampler
 from verbalizer.verbalizer import Verbalizer, VerbalizerModelUsageConfig
 from verbalizer.vocabulary import Vocabulary
-from verbalizer.patterns import owl_disjoint, owl_restriction, owl_first_rest
 
 patterns = [owl_disjoint.OwlDisjointWith, owl_restriction.OwlRestrictionPattern, owl_first_rest.OwlFirstRestPattern]
 
@@ -67,14 +66,19 @@ class LLM(ParaphraseLanguageModel):
             "output": 0.0020
         }
     }
-    default_system_message = "You are an extremely specific data expert capable of converting pseudo English sentences into a meaningful and casual paragraph without losing information and integrate them into broader text in the form of articles and research papers. Avoid repeating information. Spell out everything don't be lazy!"
+    default_system_message = "You are an extremely specific data expert capable of converting pseudo English sentences into a meaningful and casual paragraph without losing information. Avoid repeating information. Spell out everything don't be lazy!"
     default_prompt_template = [
         {
-            "User": "sundried tomato topping disjoint with a sliced tomato topping.\n"
-                    "sundried tomato topping sub class of (type a restriction, and on property a has spiciness, and some values from a mild).\n"
-                    "sundried tomato topping sub class of a tomato topping.\n"
-                    "sundried tomato topping type a class.",
-            "Assistant": "The sundried tomato topping stands out as a unique entity, distinct from the sliced tomato topping, though both fall under the broader category of tomato toppings. What sets the sundried variety apart is its mild spiciness, a specific characteristic that enhances its versatility in culinary applications. Classified as a type of class, the sundried tomato topping is defined not only by its spiciness but also by its broader significance within an ontological framework. This structured classification helps in understanding its unique properties and potential uses, from recipe creation to organizing culinary data."
+            "User": "x relation 1 y\nz relation 2 x\nm relation 3 n",
+            "Assistant": "X has this relation 1 with Y, Z shares a relation 2 with X. Moreover, m has relation 3 with n."
+        },
+        {
+            "User": "X is same as something that intersection of something that something that has at least 3 N and M.",
+            "Assistant": "X is the same as M which has at least three N"
+        },
+        {
+            "User": "X is a type of at least has Y relation some a M.\nX is a type of at least has Y relation some a N.\nX is a type of only has Y relation any of (a M and a N)",
+            "Assistant": "X is a type of Y, M, and N"
         }
     ]
 
@@ -82,7 +86,7 @@ class LLM(ParaphraseLanguageModel):
         self.model_name = model_name
         self.temperature = temperature
         self.message_templates = message_templates
-        self.client = OpenAI(api_key=api_key)
+        self.api_key = api_key
         self._in_token_usage = 0
         self._out_token_usage = 0
 
@@ -90,7 +94,7 @@ class LLM(ParaphraseLanguageModel):
         messages = self.message_templates.copy()
         messages.append({"role": "user", "content": pseudo_text})
 
-        response = self.client.chat.completions.create(
+        response = OpenAI(api_key=self.api_key).chat.completions.create(
             model=self.model_name,
             messages=messages,
             temperature=self.temperature
@@ -136,6 +140,17 @@ def replace_label(element: dict, vocabulary: Vocabulary):
     return element
 
 
+def get_number_of_concepts(vocabulary: Vocabulary, sampler: Sampler) -> int:
+    if sampler is None:
+        return len(vocabulary.object_labels)
+
+    if sampler.sample_n:
+        return min(sampler.sample_n, len(vocabulary.object_labels))
+
+    if sampler.sample_percentage:
+        return int(len(vocabulary.object_labels) * sampler.sample_percentage)
+
+
 def compute(
         initial_vocabulary: Vocabulary,
         relationships_to_remove: pd.DataFrame,
@@ -143,7 +158,6 @@ def compute(
         sampler: Sampler,
         llm: LLM
 ):
-    print(llm.name)
     vocabulary = vocabulary_from(initial_vocabulary, relationships_to_remove, rephrased_identifiers)
     verbalizer = Verbalizer(
         vocabulary, patterns=patterns, language_model=llm, usage_config=VerbalizerModelUsageConfig(0, 1, "")
@@ -152,9 +166,38 @@ def compute(
     st.session_state.preview_results = results
 
 
+def render_results_preview(vocabulary: Vocabulary):
+    if not st.session_state.preview_results:
+        return
+
+    preview_columns = ["root", "fragment", "text", "llm_text"]
+
+    if isinstance(st.session_state.preview_results, list):
+        st.dataframe(pd.DataFrame(st.session_state.preview_results, columns=preview_columns))
+        return
+
+    try:
+        first = next(st.session_state.preview_results)
+        first = replace_label(first, vocabulary)
+        new_preview_results = []
+        new_preview_results.append(first)
+        preview_table = st.dataframe(pd.DataFrame([first], columns=preview_columns))
+        for result in st.session_state.preview_results:
+            result = {key: value for key, value in result.items() if key in preview_columns}
+            result = replace_label(result, vocabulary)
+            new_preview_results.append(result)
+            preview_table.add_rows(pd.DataFrame([result], columns=preview_columns))
+
+        st.session_state.preview_results = new_preview_results
+    except Exception:
+        st.session_state.preview_results = []
+        st.error('Something went wrong during verbalization. Try to adjust your configurations.')
+
+
 # Streamlit application
 def main():
-    st.title("Ontology Verbalization Application")
+    st.set_page_config(page_title="Ontology Verbalization App", page_icon=":material/edit_note:")
+    st.title("Ontology Verbalization App")
 
     # Step 1: Upload Ontology OWL File
     st.header("Step 1: Upload Ontology OWL File", divider=True)
@@ -162,7 +205,6 @@ def main():
 
     if not uploaded_file:
         return
-
 
     graph, initial_vocabulary = load_ontology(uploaded_file)
     st.success("Ontology loaded successfully!")
@@ -213,15 +255,21 @@ def main():
     if st.toggle("Enable Sampling"):
         max_concepts = len(initial_vocabulary.object_labels)
         sample_mode = st.radio("Sampling Mode", ["Fixed Size", "Percentage"], index=0)
-
+        col1, col2 = st.columns([1, 1])
         if sample_mode == "Fixed Size":
-            sample_size = st.number_input(
-                "Number of samples", min_value=10, max_value=max_concepts, value=max_concepts
-            )
-            sampler = Sampler(sample_n=sample_size, seed=st.number_input("Seed", value=42))
+            with col1:
+                sample_size = st.number_input(
+                    "Number of samples", min_value=10, max_value=max_concepts, value=max_concepts
+                )
+            with col2:
+                seed = st.number_input("Seed", value=42)
+            sampler = Sampler(sample_n=sample_size, seed=seed)
         else:
-            sample_percentage = st.slider("Sample Percentage", min_value=10, max_value=100, value=100) / 100
-            sampler = Sampler(sample_percentage=sample_percentage, seed=st.number_input("Seed", value=42))
+            with col1:
+                sample_percentage = st.slider("Sample Percentage", min_value=10, max_value=100, value=100) / 100
+            with col2:
+                seed = st.number_input("Seed", value=42)
+            sampler = Sampler(sample_percentage=sample_percentage, seed=seed)
 
         st.success("Sampling configuration set.")
 
@@ -245,7 +293,7 @@ def main():
             num_rows="dynamic"
         )
 
-        temperature = st.slider("Temperature", min_value=0.0, max_value=2.0, value=1.0)
+        temperature = st.slider("Temperature", min_value=0.0, max_value=2.0, value=0.7, step=0.1)
 
         message_templates = [
             {"role": "system", "content": system_prompt}
@@ -262,6 +310,7 @@ def main():
                 message_templates=message_templates,
                 api_key=api_key
             )
+            st.success("LLM configured successfully!")
 
     st.subheader("Actions")
     preview_sampler = Sampler(sample_n=10, seed=42)
@@ -269,24 +318,25 @@ def main():
     if 'preview_results' not in st.session_state:
         st.session_state.preview_results = None
 
-    st.button(
-        "Preview", on_click=compute,
-        args=(initial_vocabulary, relationships_to_remove, rephrased_identifiers, preview_sampler, llm)
-    )
+    col1, col2 = st.columns([1, 1])
+    with col1:
+        st.button(
+            "Preview Verbalization",
+            on_click=compute,
+            args=(initial_vocabulary, relationships_to_remove, rephrased_identifiers, preview_sampler, llm),
+            use_container_width=True,
+            help="Verbalize up to 10 samples"
+        )
+    with col2:
+        st.button(
+            "Verbalize",
+            on_click=compute,
+            args=(initial_vocabulary, relationships_to_remove, rephrased_identifiers, sampler, llm),
+            use_container_width=True,
+            help=f"Perform verbalization of {get_number_of_concepts(initial_vocabulary, sampler)} concepts"
+        )
 
-    preview_columns = ["root", "fragment", "text", "llm_text"]
-
-    if st.session_state.preview_results:
-        try:
-            first = next(st.session_state.preview_results)
-            preview_table = st.dataframe(
-                pd.DataFrame([replace_label(first, initial_vocabulary)], columns=preview_columns))
-            for result in st.session_state.preview_results:
-                result = {key: value for key, value in result.items() if key in preview_columns}
-                preview_table.add_rows(
-                    pd.DataFrame([replace_label(result, initial_vocabulary)], columns=preview_columns))
-        except:
-            pass
+    render_results_preview(initial_vocabulary)
 
 
 if __name__ == "__main__":
